@@ -110,6 +110,12 @@ public final class ModelExporter {
         JsonArray blocksJson = new JsonArray();
         int blocks = 0;
 
+        // Ambient occlusion desligado durante a exportacao inteira (cor de vertice sem AO embutido).
+        // IMPORTANTE: mudar essa opcao dispara levelRenderer.allChanged() (recarrega todos os chunks),
+        // entao so pode ser feito UMA vez aqui, nunca por bloco.
+        boolean aoWas = mc.options.ambientOcclusion().get();
+        if (aoWas) mc.options.ambientOcclusion().set(false);
+
         try {
             for (BlockPos mutable : BlockPos.betweenClosed(min, max)) {
                 BlockPos pos = mutable.immutable();
@@ -137,6 +143,7 @@ public final class ModelExporter {
                 }
             }
         } finally {
+            if (aoWas) mc.options.ambientOcclusion().set(true);
             wv.close(); wvt.close(); wvn.close(); wf.close();
             atlasImg.close();
             spriteCache.values().forEach(NativeImage::close);
@@ -323,18 +330,12 @@ public final class ModelExporter {
      * Renderiza o bloco com o renderizador do jogo, mas escrevendo num VertexConsumer nosso.
      * E o mesmo caminho usado por pistoes e blocos caindo; o Fabric/Indium/Indigo desviam modelos FRAPI
      * (copycats, CT do Create...) pro contexto deles, e o que sai sao vertices comuns.
-     * Ambient occlusion fica desligado so durante a chamada, pra a cor do vertice nao ter AO embutido.
+     * O ambient occlusion ja foi desligado em run() (uma vez so, por causa do allChanged()).
      */
     private List<QuadCollector.Quad> rendererQuads(ExportView view, BerCapture capture, BlockState st, BlockPos pos) {
         capture.begin();
-        boolean ao = mc.options.ambientOcclusion().get();
-        mc.options.ambientOcclusion().set(false);
-        try {
-            mc.getBlockRenderer().renderBatched(st, pos, view, new PoseStack(),
-                capture.getBuffer(RenderType.solid()), cull, RandomSource.create(st.getSeed(pos)));
-        } finally {
-            mc.options.ambientOcclusion().set(ao);
-        }
+        mc.getBlockRenderer().renderBatched(st, pos, view, new PoseStack(),
+            capture.getBuffer(RenderType.solid()), cull, RandomSource.create(st.getSeed(pos)));
         return new ArrayList<>(capture.quads());
     }
 
