@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "blockexport",
+  "version": "${version}",
+  "name": "Block Export",
+  "description": "Exporta blocos (modelos + texturas + estado) para OBJ usando a Fabric Rendering API. Funciona com Create Copycats+ e outros mods que emitem quads dinamicos.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.blockexport.BlockExportClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.21",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-api": "*"
+  }
+}
