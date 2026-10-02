@@ -33,7 +33,9 @@ final class ExportView implements RenderAttachedBlockView {
     public int getMinBuildHeight() { return level.getMinBuildHeight(); }
 
     // --- BlockAndTintGetter
-    public float getShade(Direction dir, boolean shaded) { return level.getShade(dir, shaded); }
+    // Sem sombreamento por face: o renderizador do jogo multiplica a cor do vertice por este valor,
+    // e queremos so o tint (o brilho de cada face fica por conta do Blender).
+    public float getShade(Direction dir, boolean shaded) { return 1.0f; }
     public LevelLightEngine getLightEngine() { return level.getLightEngine(); }
     public int getBlockTint(BlockPos pos, ColorResolver resolver) { return level.getBlockTint(pos, resolver); }
 

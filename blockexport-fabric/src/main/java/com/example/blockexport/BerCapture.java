@@ -42,8 +42,12 @@ final class BerCapture implements MultiBufferSource {
     private final List<QuadCollector.Quad> out = new ArrayList<>();
     private final Set<String> unresolved = new TreeSet<>();
 
-    BerCapture(BiFunction<Float, Float, TextureAtlasSprite> spriteFinder) {
+    /** Se true, cores de vertice cinza (sombreamento residual do renderizador de blocos) viram branco. */
+    private final boolean normalizeGrey;
+
+    BerCapture(BiFunction<Float, Float, TextureAtlasSprite> spriteFinder, boolean normalizeGrey) {
         this.spriteFinder = spriteFinder;
+        this.normalizeGrey = normalizeGrey;
     }
 
     void begin() {
@@ -196,7 +200,9 @@ final class BerCapture implements MultiBufferSource {
                 sprite = spriteFinder.apply(su / n, sv / n);
                 if (sprite == null) return;
             }
-            out.add(new QuadCollector.Quad(pos, uv, -1, null, sprite, tex, rgb & 0xFFFFFF));
+            int c = rgb & 0xFFFFFF;
+            if (normalizeGrey && ((c >> 16) & 255) == ((c >> 8) & 255) && ((c >> 8) & 255) == (c & 255)) c = 0xFFFFFF;
+            out.add(new QuadCollector.Quad(pos, uv, -1, null, sprite, tex, c));
         }
     }
 }

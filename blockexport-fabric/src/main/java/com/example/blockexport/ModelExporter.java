@@ -8,12 +8,12 @@ import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.serialization.JsonOps;
-import net.fabricmc.fabric.api.renderer.v1.RendererAccess;
 import net.fabricmc.fabric.api.renderer.v1.model.SpriteFinder;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.OverlayTexture;
@@ -89,17 +89,13 @@ public final class ModelExporter {
     }
 
     public Result run(ClientLevel level, BlockPos p1, BlockPos p2) throws IOException {
-        if (!RendererAccess.INSTANCE.hasRenderer()) {
-            throw new IOException("Nenhum renderer da Fabric Rendering API ativo. Use o Indigo (vem na Fabric API) "
-                + "ou Sodium 0.5+; em Sodium antigo instale o Indium.");
-        }
         Files.createDirectories(dir.resolve("textures"));
         captureAtlas();
 
         TextureAtlas atlas = mc.getModelManager().getAtlas(TextureAtlas.LOCATION_BLOCKS);
         SpriteFinder finder = SpriteFinder.get(atlas);
-        QuadCollector collector = new QuadCollector(finder);
-        BerCapture berCapture = new BerCapture((u, v) -> finder.find(u, v));
+        BerCapture blockCapture = new BerCapture((u, v) -> finder.find(u, v), true);   // blocos (cinza -> branco)
+        BerCapture berCapture = new BerCapture((u, v) -> finder.find(u, v), false);    // BlockEntityRenderers
         ExportView view = new ExportView(level);
 
         BlockPos min = new BlockPos(Math.min(p1.getX(), p2.getX()), Math.min(p1.getY(), p2.getY()), Math.min(p1.getZ(), p2.getZ()));
@@ -130,7 +126,7 @@ public final class ModelExporter {
                     continue;
                 }
                 try {
-                    JsonObject info = exportBlock(level, view, collector, berCapture, pos, st, id, min, be, hasModel);
+                    JsonObject info = exportBlock(level, view, blockCapture, berCapture, pos, st, id, min, be, hasModel);
                     if (info != null) {
                         blocksJson.add(info);
                         blocks++;
@@ -179,30 +175,35 @@ public final class ModelExporter {
 
     // ------------------------------------------------------------------ bloco
 
-    private JsonObject exportBlock(ClientLevel level, ExportView view, QuadCollector collector, BerCapture berCapture,
+    private JsonObject exportBlock(ClientLevel level, ExportView view, BerCapture blockCapture, BerCapture berCapture,
                                    BlockPos pos, BlockState st, String id, BlockPos min,
                                    BlockEntity be, boolean hasModel) throws IOException {
         List<QuadCollector.Quad> quads = new ArrayList<>();
 
         // 1) modelo do bloco
-        //    - modelo vanilla simples: getQuads direto (sem FRAPI)
-        //    - modelo dinamico (copycat): FRAPI, com o material vindo do RenderAttachment do ExportView
-        //    - se a FRAPI falhar: reserva com getQuads (sem o material embrulhado) + stack trace em blocks.json
+        //    - modelo vanilla simples: getQuads direto
+        //    - modelo dinamico (copycat, textura conectada...): renderizador do proprio jogo
+        //      (BlockRenderDispatcher.renderBatched), que monta o contexto certo (Indigo/Indium/Sodium) e
+        //      resolve o material embrulhado via RenderAttachment do ExportView
+        //    - se isso falhar ou vier vazio: reserva com getQuads (sem o material embrulhado)
         boolean fallback = false;
         if (hasModel) {
             BakedModel model = mc.getBlockRenderer().getBlockModel(st);
             if (model.isVanillaAdapter()) {
-                quads.addAll(vanillaQuads(model, st, pos));
+                quads.addAll(vanillaQuads(level, model, st, pos));
             } else {
+                List<QuadCollector.Quad> viaRenderer = null;
                 try {
-                    collector.begin(st, st.getSeed(pos));
-                    model.emitBlockQuads(view, st, pos, collector.randomSupplier(), collector.context());
-                    quads.addAll(collector.quads());
+                    viaRenderer = rendererQuads(view, blockCapture, st, pos);
                 } catch (Throwable t) {
-                    logError(id, "FRAPI", t);
-                    skipped.merge(id + " [FRAPI falhou: " + t.getClass().getSimpleName() + ", usou reserva vanilla]", 1, Integer::sum);
-                    quads.addAll(vanillaQuads(model, st, pos));
+                    logError(id, "renderer", t);
+                    skipped.merge(id + " [renderer falhou: " + t.getClass().getSimpleName() + ", usou reserva vanilla]", 1, Integer::sum);
+                }
+                if (viaRenderer == null || viaRenderer.isEmpty()) {
+                    quads.addAll(vanillaQuads(level, model, st, pos));
                     fallback = true;
+                } else {
+                    quads.addAll(viaRenderer);
                 }
             }
         }
@@ -222,10 +223,10 @@ public final class ModelExporter {
             }
         }
 
-        Vec3 off = st.getOffset(level, pos);
-        float ox = pos.getX() - min.getX() + (float) off.x;
-        float oy = pos.getY() - min.getY() + (float) off.y;
-        float oz = pos.getZ() - min.getZ() + (float) off.z;
+        // (o offset aleatorio de flores/bambu ja vem embutido nos quads: o renderizador aplica, e vanillaQuads soma)
+        float ox = pos.getX() - min.getX();
+        float oy = pos.getY() - min.getY();
+        float oz = pos.getZ() - min.getZ();
 
         String objName = safe((pos.getX() - min.getX()) + "_" + (pos.getY() - min.getY()) + "_" + (pos.getZ() - min.getZ()) + "_" + id);
         BlockColors colors = mc.getBlockColors();
@@ -296,16 +297,45 @@ public final class ModelExporter {
         return true;
     }
 
-    /** Quads de um modelo via BakedModel.getQuads (caminho vanilla, sem FRAPI). */
-    private List<QuadCollector.Quad> vanillaQuads(BakedModel model, BlockState st, BlockPos pos) {
+    /** Quads de um modelo via BakedModel.getQuads (caminho vanilla), ja com o offset aleatorio do bloco. */
+    private List<QuadCollector.Quad> vanillaQuads(ClientLevel level, BakedModel model, BlockState st, BlockPos pos) {
         List<QuadCollector.Quad> res = new ArrayList<>();
+        Vec3 off = st.getOffset(level, pos);
         RandomSource rand = RandomSource.create();
         for (int i = -1; i < 6; i++) {
             Direction d = i < 0 ? null : Direction.values()[i];
             rand.setSeed(st.getSeed(pos));
-            for (BakedQuad q : model.getQuads(st, d, rand)) res.add(QuadCollector.fromBaked(q, d));
+            for (BakedQuad q : model.getQuads(st, d, rand)) {
+                QuadCollector.Quad quad = QuadCollector.fromBaked(q, d);
+                float[] p = quad.pos();
+                for (int k = 0; k < 4; k++) {
+                    p[k * 3] += (float) off.x;
+                    p[k * 3 + 1] += (float) off.y;
+                    p[k * 3 + 2] += (float) off.z;
+                }
+                res.add(quad);
+            }
         }
         return res;
+    }
+
+    /**
+     * Renderiza o bloco com o renderizador do jogo, mas escrevendo num VertexConsumer nosso.
+     * E o mesmo caminho usado por pistoes e blocos caindo; o Fabric/Indium/Indigo desviam modelos FRAPI
+     * (copycats, CT do Create...) pro contexto deles, e o que sai sao vertices comuns.
+     * Ambient occlusion fica desligado so durante a chamada, pra a cor do vertice nao ter AO embutido.
+     */
+    private List<QuadCollector.Quad> rendererQuads(ExportView view, BerCapture capture, BlockState st, BlockPos pos) {
+        capture.begin();
+        boolean ao = mc.options.ambientOcclusion().get();
+        mc.options.ambientOcclusion().set(false);
+        try {
+            mc.getBlockRenderer().renderBatched(st, pos, view, new PoseStack(),
+                capture.getBuffer(RenderType.solid()), cull, RandomSource.create(st.getSeed(pos)));
+        } finally {
+            mc.options.ambientOcclusion().set(ao);
+        }
+        return new ArrayList<>(capture.quads());
     }
 
     /** Guarda o stack trace (1 por tipo de erro) em blocks.json > errors e imprime no log do jogo. */
