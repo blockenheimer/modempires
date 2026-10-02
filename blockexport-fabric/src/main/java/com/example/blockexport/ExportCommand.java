@@ -23,6 +23,7 @@ import java.time.format.DateTimeFormatter;
  * /blockexport radius <r> [cull]                 -> exporta cubo ao redor do jogador
  * /blockexport box x1 y1 z1 x2 y2 z2 [cull]      -> exporta caixa por coordenadas
  * /blockexport ber <true|false>                  -> liga/desliga captura de BlockEntityRenderers (padrao: ligado)
+ * /blockexport print <true|false>                -> modo impressao 3D: 1 objeto, 1 textura (atlas), sem faces internas
  *
  * cull = true (padrao) remove faces encobertas; false mantem todas as faces.
  */
@@ -30,6 +31,7 @@ public final class ExportCommand {
     private static final long MAX_VOLUME = 20_000_000L;
     private static BlockPos pos1, pos2;
     private static boolean ber = true;
+    private static boolean print = false;
 
     private static RequiredArgumentBuilder<FabricClientCommandSource, Integer> i(String name) {
         return ClientCommandManager.argument(name, IntegerArgumentType.integer(-30_000_000, 30_000_000));
@@ -50,6 +52,13 @@ public final class ExportCommand {
                     ber = BoolArgumentType.getBool(c, "on");
                     return msg(c, "BlockEntityRenderers " + (ber ? "ligados" : "desligados")
                         + (ber ? " (se usa Create, desligue o Flywheel antes: /flywheel backend off)" : ""));
+                })))
+            .then(ClientCommandManager.literal("print")
+                .then(ClientCommandManager.argument("on", BoolArgumentType.bool()).executes(c -> {
+                    print = BoolArgumentType.getBool(c, "on");
+                    return msg(c, print
+                        ? "Modo impressao 3D LIGADO: sai model_print.obj + atlas.png (1 objeto, 1 textura, sem faces internas)."
+                        : "Modo impressao 3D desligado (1 objeto por bloco, 1 textura por sprite).");
                 })))
             .then(ClientCommandManager.literal("selection")
                 .executes(c -> selection(c, true))
@@ -102,7 +111,7 @@ public final class ExportCommand {
 
         msg(c, "Exportando " + vol + " blocos... o jogo pode travar um pouco. (Chunks nao carregados saem vazios!)");
         try {
-            ModelExporter.Result r = new ModelExporter(dir, cull, ber).run(level, a, b);
+            ModelExporter.Result r = new ModelExporter(dir, cull, ber, print).run(level, a, b);
             String p = dir.toAbsolutePath().toString();
             c.getSource().sendFeedback(
                 Component.literal("Pronto: " + r.blocks() + " blocos, " + r.quads() + " quads, " + r.materials() + " materiais. ")

@@ -66,6 +66,7 @@ public final class ModelExporter {
     private final Path dir;
     private final boolean cull;
     private final boolean ber;
+    private final boolean print;
     private final Minecraft mc = Minecraft.getInstance();
 
     private NativeImage atlasImg;
@@ -78,14 +79,24 @@ public final class ModelExporter {
     private final JsonArray errorsJson = new JsonArray();
     private final Set<String> errorKeys = new HashSet<>();
 
+    // modo impressao 3D: faces ficam em memoria ate o fim, pra remover faces internas e montar o atlas
+    private record PrintFace(float[] p, float[] t, String tex) {}
+    private record K3(int a, int b, int c) {}
+    private record K2(int a, int b) {}
+    private static final int ATLAS_PAD = 2, ATLAS_MAX = 8192;
+    private final List<PrintFace> printFaces = new ArrayList<>();
+    private final Map<String, NativeImage> printImages = new LinkedHashMap<>();
+    private int printRemoved = 0;
+
     private BufferedWriter wv, wvt, wvn, wf;
     private int vi = 1, ni = 1, quadCount = 0;
     private String curMat;
 
-    public ModelExporter(Path dir, boolean cull, boolean ber) {
+    public ModelExporter(Path dir, boolean cull, boolean ber, boolean print) {
         this.dir = dir;
-        this.cull = cull;
+        this.cull = cull || print;      // impressao sempre remove faces encobertas
         this.ber = ber;
+        this.print = print;
     }
 
     public Result run(ClientLevel level, BlockPos p1, BlockPos p2) throws IOException {
@@ -151,6 +162,10 @@ public final class ModelExporter {
         }
         berCapture.unresolved().forEach(s -> skipped.merge("BER sem textura resolvida: " + s, 1, Integer::sum));
 
+        if (print) {
+            writePrint();
+            for (Path t : tmp) Files.deleteIfExists(t);
+        } else {
         // MTL
         StringBuilder mtlText = new StringBuilder("# Block Export\n");
         mtl.values().forEach(mtlText::append);
@@ -163,6 +178,8 @@ public final class ModelExporter {
         }
         for (Path t : tmp) Files.deleteIfExists(t);
 
+        }
+
         // JSON
         JsonObject root = new JsonObject();
         JsonArray origin = new JsonArray();
@@ -170,6 +187,8 @@ public final class ModelExporter {
         root.add("originWorldPos", origin);
         root.addProperty("cull", cull);
         root.addProperty("blockEntityRenderers", ber);
+        root.addProperty("printMode", print);
+        root.addProperty("printFacesRemoved", printRemoved);
         JsonObject sk = new JsonObject();
         skipped.forEach(sk::addProperty);
         root.add("skipped", sk);
@@ -177,7 +196,7 @@ public final class ModelExporter {
         root.add("blocks", blocksJson);
         Files.writeString(dir.resolve("blocks.json"), GSON.toJson(root));
 
-        return new Result(blocks, quadCount, mtl.size(), skipped);
+        return new Result(blocks, quadCount, print ? printImages.size() : mtl.size(), skipped);
     }
 
     // ------------------------------------------------------------------ bloco
@@ -390,6 +409,10 @@ public final class ModelExporter {
         float[] nrm = QuadCollector.faceNormal(p);
 
         String mat = sprite != null ? material(sprite, tint) : materialTex(q.texture(), tint);
+        if (print) {
+            printFaces.add(new PrintFace(p, t, mat));
+            return;
+        }
         if (!mat.equals(curMat)) {
             wf.write("usemtl " + mat + "\n");
             curMat = mat;
@@ -405,6 +428,179 @@ public final class ModelExporter {
         wf.write(face.append('\n').toString());
         vi += vc;
         ni++;
+    }
+
+    // ------------------------------------------------------------------ modo impressao 3D
+
+    /** Copia da imagem ja multiplicada pelo tint (fica guardada ate montar o atlas). */
+    private NativeImage tintedCopy(NativeImage base, int tint) {
+        int tr = (tint >> 16) & 255, tg = (tint >> 8) & 255, tb = tint & 255;
+        NativeImage out = new NativeImage(base.getWidth(), base.getHeight(), false);
+        for (int y = 0; y < base.getHeight(); y++) {
+            for (int x = 0; x < base.getWidth(); x++) {
+                int px = base.getPixelRGBA(x, y);              // ABGR
+                int a = px >>> 24, b = (px >> 16) & 255, g = (px >> 8) & 255, r = px & 255;
+                out.setPixelRGBA(x, y, (a << 24) | ((b * tb / 255) << 16) | ((g * tg / 255) << 8) | (r * tr / 255));
+            }
+        }
+        return out;
+    }
+
+    private static String faceKey(float[] p) {
+        int n = p.length / 3;
+        String[] v = new String[n];
+        for (int i = 0; i < n; i++)
+            v[i] = Math.round(p[i * 3] * 1000) + "," + Math.round(p[i * 3 + 1] * 1000) + "," + Math.round(p[i * 3 + 2] * 1000);
+        Arrays.sort(v);
+        return String.join("|", v);
+    }
+
+    /**
+     * Remove faces internas: duas faces com os mesmos vertices e normais opostas (parede entre dois blocos
+     * encostados) somem juntas. Duplicatas na mesma direcao (z-fighting) ficam so uma.
+     */
+    private List<PrintFace> removeInternalFaces() {
+        Map<String, List<Integer>> groups = new HashMap<>();
+        for (int i = 0; i < printFaces.size(); i++)
+            groups.computeIfAbsent(faceKey(printFaces.get(i).p()), k -> new ArrayList<>(2)).add(i);
+
+        boolean[] drop = new boolean[printFaces.size()];
+        for (List<Integer> g : groups.values()) {
+            if (g.size() < 2) continue;
+            float[] n0 = QuadCollector.faceNormal(printFaces.get(g.get(0)).p());
+            List<Integer> same = new ArrayList<>(), opposite = new ArrayList<>();
+            for (int i : g) {
+                float[] n = QuadCollector.faceNormal(printFaces.get(i).p());
+                (n[0] * n0[0] + n[1] * n0[1] + n[2] * n0[2] >= 0 ? same : opposite).add(i);
+            }
+            int pairs = Math.min(same.size(), opposite.size());
+            for (int k = 0; k < pairs; k++) { drop[same.get(k)] = true; drop[opposite.get(k)] = true; }
+            for (int k = pairs + 1; k < same.size(); k++) drop[same.get(k)] = true;
+            for (int k = pairs + 1; k < opposite.size(); k++) drop[opposite.get(k)] = true;
+        }
+        List<PrintFace> kept = new ArrayList<>(printFaces.size());
+        for (int i = 0; i < printFaces.size(); i++) {
+            if (drop[i]) printRemoved++; else kept.add(printFaces.get(i));
+        }
+        return kept;
+    }
+
+    /** Composita pixels transparentes sobre cinza claro (impressoras coloridas ignoram alpha). */
+    private static int flatten(int px) {
+        int a = px >>> 24;
+        if (a == 255) return px;
+        int b = (px >> 16) & 255, g = (px >> 8) & 255, r = px & 255, bg = 220;
+        r = (r * a + bg * (255 - a)) / 255;
+        g = (g * a + bg * (255 - a)) / 255;
+        b = (b * a + bg * (255 - a)) / 255;
+        return 0xFF000000 | (b << 16) | (g << 8) | r;
+    }
+
+    /** Monta model_print.obj (1 objeto, vertices compartilhados), model_print.mtl (1 material) e atlas.png. */
+    private void writePrint() throws IOException {
+        try {
+            if (printImages.isEmpty() || printFaces.isEmpty()) throw new IOException("Nenhuma face pra exportar.");
+            List<PrintFace> faces = removeInternalFaces();
+
+            // --- atlas: empacotamento em prateleiras, com borda de 2px replicada (evita sangrar no filtro) ---
+            List<String> names = new ArrayList<>(printImages.keySet());
+            names.sort((x, y) -> {
+                NativeImage ia = printImages.get(x), ib = printImages.get(y);
+                int c = Integer.compare(ib.getHeight(), ia.getHeight());
+                return c != 0 ? c : Integer.compare(ib.getWidth(), ia.getWidth());
+            });
+            Map<String, int[]> pos = new HashMap<>();
+            int aw = 0, ah = 0;
+            for (int w = 256; w <= ATLAS_MAX && aw == 0; w *= 2) {
+                pos.clear();
+                int x = 0, y = 0, rowH = 0;
+                boolean ok = true;
+                for (String nm : names) {
+                    NativeImage im = printImages.get(nm);
+                    int tw = im.getWidth() + 2 * ATLAS_PAD, th = im.getHeight() + 2 * ATLAS_PAD;
+                    if (tw > w) { ok = false; break; }
+                    if (x + tw > w) { x = 0; y += rowH; rowH = 0; }
+                    pos.put(nm, new int[]{x + ATLAS_PAD, y + ATLAS_PAD});
+                    x += tw;
+                    rowH = Math.max(rowH, th);
+                }
+                if (ok && y + rowH <= w) { aw = w; ah = y + rowH; }
+            }
+            if (aw == 0) throw new IOException("Texturas demais pra caber num atlas de " + ATLAS_MAX + "x" + ATLAS_MAX + ". Exporte uma area menor.");
+            ah = Integer.highestOneBit(Math.max(ah, 2) - 1) << 1;      // proxima potencia de 2
+
+            try (NativeImage atlas = new NativeImage(aw, ah, true)) {
+                for (String nm : names) {
+                    NativeImage im = printImages.get(nm);
+                    int[] o = pos.get(nm);
+                    int w = im.getWidth(), h = im.getHeight();
+                    for (int yy = -ATLAS_PAD; yy < h + ATLAS_PAD; yy++) {
+                        for (int xx = -ATLAS_PAD; xx < w + ATLAS_PAD; xx++) {
+                            int sx = Math.min(Math.max(xx, 0), w - 1), sy = Math.min(Math.max(yy, 0), h - 1);
+                            atlas.setPixelRGBA(o[0] + xx, o[1] + yy, flatten(im.getPixelRGBA(sx, sy)));
+                        }
+                    }
+                }
+                atlas.writeToFile(dir.resolve("atlas.png"));
+            }
+
+            // --- OBJ: vertices compartilhados por posicao (malha conectada), UV remapeada pro atlas ---
+            Map<K3, Integer> vmap = new HashMap<>();
+            Map<K2, Integer> tmap = new HashMap<>();
+            StringBuilder vs = new StringBuilder(), ts = new StringBuilder(), fs = new StringBuilder();
+            int vc = 0, tc = 0;
+
+            for (PrintFace face : faces) {
+                NativeImage im = printImages.get(face.tex());
+                int[] o = pos.get(face.tex());
+                int n = face.p().length / 3;
+                int[] vi = new int[n], ti = new int[n];
+                for (int k = 0; k < n; k++) {
+                    float x = face.p()[k * 3], y = face.p()[k * 3 + 1], z = face.p()[k * 3 + 2];
+                    K3 key = new K3(Math.round(x * 1000), Math.round(y * 1000), Math.round(z * 1000));
+                    Integer idx = vmap.get(key);
+                    if (idx == null) {
+                        idx = ++vc;
+                        vmap.put(key, idx);
+                        vs.append("v ").append(f(x)).append(' ').append(f(y)).append(' ').append(f(z)).append('\n');
+                    }
+                    vi[k] = idx;
+
+                    float ul = Math.min(1f, Math.max(0f, face.t()[k * 2]));
+                    float vl = Math.min(1f, Math.max(0f, 1f - face.t()[k * 2 + 1]));   // V local, de cima pra baixo
+                    float u = (o[0] + ul * im.getWidth()) / aw;
+                    float v = 1f - (o[1] + vl * im.getHeight()) / ah;
+                    K2 tk = new K2(Math.round(u * 100000), Math.round(v * 100000));
+                    Integer tidx = tmap.get(tk);
+                    if (tidx == null) {
+                        tidx = ++tc;
+                        tmap.put(tk, tidx);
+                        ts.append("vt ").append(f(u)).append(' ').append(f(v)).append('\n');
+                    }
+                    ti[k] = tidx;
+                }
+                // descarta face degenerada (vertices coincidentes depois de juntar)
+                int distinct = 0;
+                for (int a = 0; a < n; a++) {
+                    boolean dup = false;
+                    for (int b = 0; b < a; b++) if (vi[a] == vi[b]) { dup = true; break; }
+                    if (!dup) distinct++;
+                }
+                if (distinct < 3) continue;
+                fs.append('f');
+                for (int k = 0; k < n; k++) fs.append(' ').append(vi[k]).append('/').append(ti[k]);
+                fs.append('\n');
+            }
+
+            Files.writeString(dir.resolve("model_print.obj"),
+                "# Block Export - modo impressao 3D (1 bloco = 1 unidade, Y para cima)\n"
+                    + "mtllib model_print.mtl\no minecraft_build\n"
+                    + vs + ts + "usemtl atlas\n" + fs);
+            Files.writeString(dir.resolve("model_print.mtl"),
+                "newmtl atlas\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nd 1\nillum 1\nmap_Kd atlas.png\n");
+        } finally {
+            printImages.values().forEach(NativeImage::close);
+        }
     }
 
     private static String f(float v) {
@@ -434,6 +630,10 @@ public final class ModelExporter {
 
     private String registerMaterial(String baseName, NativeImage base, boolean alpha, int tint) throws IOException {
         String texName = tint == 0xFFFFFF ? baseName : baseName + "_" + String.format("%06x", tint);
+        if (print) {
+            printImages.computeIfAbsent(texName, k -> tintedCopy(base, tint));
+            return texName;
+        }
         String mat = texName + (alpha ? "_a" : "");
 
         if (!mtl.containsKey(mat)) {
