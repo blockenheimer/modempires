@@ -20,7 +20,10 @@ import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.BakedModel;
+import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.util.RandomSource;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
@@ -72,6 +75,8 @@ public final class ModelExporter {
     private final Set<String> texDone = new HashSet<>();
     private final Map<String, String> mtl = new LinkedHashMap<>();
     private final Map<String, Integer> skipped = new TreeMap<>();
+    private final JsonArray errorsJson = new JsonArray();
+    private final Set<String> errorKeys = new HashSet<>();
 
     private BufferedWriter wv, wvt, wvn, wf;
     private int vi = 1, ni = 1, quadCount = 0;
@@ -132,6 +137,7 @@ public final class ModelExporter {
                     }
                 } catch (Throwable t) {
                     skipped.merge(id + " [erro: " + t.getClass().getSimpleName() + "]", 1, Integer::sum);
+                    logError(id, "export", t);
                 }
             }
         } finally {
@@ -164,6 +170,7 @@ public final class ModelExporter {
         JsonObject sk = new JsonObject();
         skipped.forEach(sk::addProperty);
         root.add("skipped", sk);
+        root.add("errors", errorsJson);
         root.add("blocks", blocksJson);
         Files.writeString(dir.resolve("blocks.json"), GSON.toJson(root));
 
@@ -177,12 +184,27 @@ public final class ModelExporter {
                                    BlockEntity be, boolean hasModel) throws IOException {
         List<QuadCollector.Quad> quads = new ArrayList<>();
 
-        // 1) modelo do bloco (copycat: o material embrulhado vem do RenderAttachment do ExportView)
+        // 1) modelo do bloco
+        //    - modelo vanilla simples: getQuads direto (sem FRAPI)
+        //    - modelo dinamico (copycat): FRAPI, com o material vindo do RenderAttachment do ExportView
+        //    - se a FRAPI falhar: reserva com getQuads (sem o material embrulhado) + stack trace em blocks.json
+        boolean fallback = false;
         if (hasModel) {
             BakedModel model = mc.getBlockRenderer().getBlockModel(st);
-            collector.begin(st, st.getSeed(pos));
-            model.emitBlockQuads(view, st, pos, collector.randomSupplier(), collector.context());
-            quads.addAll(collector.quads());
+            if (model.isVanillaAdapter()) {
+                quads.addAll(vanillaQuads(model, st, pos));
+            } else {
+                try {
+                    collector.begin(st, st.getSeed(pos));
+                    model.emitBlockQuads(view, st, pos, collector.randomSupplier(), collector.context());
+                    quads.addAll(collector.quads());
+                } catch (Throwable t) {
+                    logError(id, "FRAPI", t);
+                    skipped.merge(id + " [FRAPI falhou: " + t.getClass().getSimpleName() + ", usou reserva vanilla]", 1, Integer::sum);
+                    quads.addAll(vanillaQuads(model, st, pos));
+                    fallback = true;
+                }
+            }
         }
 
         // 2) BlockEntityRenderer (eixos, engrenagens, baus, camas, ...)
@@ -196,6 +218,7 @@ public final class ModelExporter {
                 }
             } catch (Throwable t) {
                 skipped.merge(id + " [BER erro: " + t.getClass().getSimpleName() + "]", 1, Integer::sum);
+                logError(id, "BER", t);
             }
         }
 
@@ -257,6 +280,7 @@ public final class ModelExporter {
         o.add("sprites", sp);
         o.addProperty("quads", n);
         o.addProperty("berQuads", berQuads);
+        o.addProperty("fallbackVanilla", fallback);
         return o;
     }
 
@@ -270,6 +294,35 @@ public final class ModelExporter {
         if (renderer == null) return false;
         renderer.render(be, 0f, new PoseStack(), capture, LightTexture.FULL_BRIGHT, OverlayTexture.NO_OVERLAY);
         return true;
+    }
+
+    /** Quads de um modelo via BakedModel.getQuads (caminho vanilla, sem FRAPI). */
+    private List<QuadCollector.Quad> vanillaQuads(BakedModel model, BlockState st, BlockPos pos) {
+        List<QuadCollector.Quad> res = new ArrayList<>();
+        RandomSource rand = RandomSource.create();
+        for (int i = -1; i < 6; i++) {
+            Direction d = i < 0 ? null : Direction.values()[i];
+            rand.setSeed(st.getSeed(pos));
+            for (BakedQuad q : model.getQuads(st, d, rand)) res.add(QuadCollector.fromBaked(q, d));
+        }
+        return res;
+    }
+
+    /** Guarda o stack trace (1 por tipo de erro) em blocks.json > errors e imprime no log do jogo. */
+    private void logError(String blockId, String stage, Throwable t) {
+        StackTraceElement[] st = t.getStackTrace();
+        String key = stage + "|" + t.getClass().getName() + "|" + (st.length > 0 ? st[0].toString() : "?");
+        if (!errorKeys.add(key) || errorKeys.size() > 25) return;
+
+        JsonObject e = new JsonObject();
+        e.addProperty("block", blockId);
+        e.addProperty("stage", stage);
+        e.addProperty("exception", t.toString());
+        JsonArray frames = new JsonArray();
+        for (int i = 0; i < Math.min(st.length, 14); i++) frames.add(st[i].toString());
+        e.add("stack", frames);
+        errorsJson.add(e);
+        t.printStackTrace();
     }
 
     private static <T extends Comparable<T>> String propValue(BlockState s, Property<T> p) {

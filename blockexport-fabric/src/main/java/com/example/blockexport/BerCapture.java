@@ -34,6 +34,8 @@ import java.util.regex.Pattern;
 final class BerCapture implements MultiBufferSource {
 
     private static final Pattern TEX = Pattern.compile("[a-z0-9_.\\-]+:[a-z0-9/_.\\-]+\\.png");
+    // texturas registradas sem .png (ex.: paginas de fonte "minecraft:default/0")
+    private static final Pattern TEX_OPT = Pattern.compile("texture\\[Optional\\[([a-z0-9_.\\-]+:[a-z0-9/_.\\-]+)\\]");
 
     private final BiFunction<Float, Float, TextureAtlasSprite> spriteFinder;
     private final Map<RenderType, Sink> sinks = new HashMap<>();
@@ -85,8 +87,14 @@ final class BerCapture implements MultiBufferSource {
             VertexFormat.Mode mode = rt.mode();
             int vertices = mode == VertexFormat.Mode.QUADS ? 4 : mode == VertexFormat.Mode.TRIANGLES ? 3 : 0;
 
-            Matcher m = TEX.matcher(rt.toString());
-            ResourceLocation loc = m.find() ? ResourceLocation.tryParse(m.group()) : null;
+            String rtText = rt.toString();
+            Matcher m = TEX.matcher(rtText);
+            String found = m.find() ? m.group() : null;
+            if (found == null) {
+                Matcher m2 = TEX_OPT.matcher(rtText);
+                if (m2.find()) found = m2.group(1);
+            }
+            ResourceLocation loc = found == null ? null : ResourceLocation.tryParse(found);
             this.blocksAtlas = TextureAtlas.LOCATION_BLOCKS.equals(loc);
             this.tex = blocksAtlas ? null : loc;
 

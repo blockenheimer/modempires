@@ -47,6 +47,21 @@ final class QuadCollector {
     record Quad(float[] pos, float[] uv, int colorIndex, Direction cullFace,
                 TextureAtlasSprite sprite, ResourceLocation texture, int color) {}
 
+    /** Converte um BakedQuad vanilla direto em Quad (sem passar pela FRAPI). O sprite vem do proprio quad. */
+    static Quad fromBaked(BakedQuad q, Direction cullFace) {
+        int[] d = q.getVertices();              // BLOCK format: 8 ints por vertice
+        float[] p = new float[12];
+        float[] t = new float[8];
+        for (int i = 0; i < 4; i++) {
+            p[i * 3] = Float.intBitsToFloat(d[i * 8]);
+            p[i * 3 + 1] = Float.intBitsToFloat(d[i * 8 + 1]);
+            p[i * 3 + 2] = Float.intBitsToFloat(d[i * 8 + 2]);
+            t[i * 2] = Float.intBitsToFloat(d[i * 8 + 4]);
+            t[i * 2 + 1] = Float.intBitsToFloat(d[i * 8 + 5]);
+        }
+        return new Quad(p, t, q.getTintIndex(), cullFace, q.getSprite(), null, -1);
+    }
+
     /** Normal da face (quad: pelas diagonais; triangulo: pelas arestas). */
     static float[] faceNormal(float[] p) {
         int n = p.length / 3;
